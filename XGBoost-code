@@ -1,0 +1,192 @@
+# Install necessary libraries
+!pip install xgboost optuna pandas numpy scikit-learn
+
+import pandas as pd
+import numpy as np
+import os
+import optuna
+from sklearn.preprocessing import LabelEncoder, StandardScaler, OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.model_selection import StratifiedKFold, cross_val_score
+from xgboost import XGBClassifier
+from google.colab import files
+
+# --- 1. Load Data ---
+print("Loading data...")
+if not os.path.exists("train.csv") or not os.path.exists("test.csv"):
+    print("\n🚨 ERROR: One or both files (train.csv, test.csv) not found.")
+    print("Please upload them via the left sidebar 'Files' icon.")
+    exit()
+
+train = pd.read_csv("train.csv")
+test = pd.read_csv("test.csv")
+test_ids = test['id'].copy()
+y = train['WeightCategory']
+
+# Combine for consistent feature engineering
+combined_df = pd.concat([train.drop('WeightCategory', axis=1), test], ignore_index=True)
+
+# --- 2. Feature Engineering ---
+
+# Calculate BMI (Crucial Feature)
+combined_df['BMI'] = combined_df['Weight'] / (combined_df['Height'] ** 2)
+
+# MTRANS Feature Consolidation
+merge_map = {
+    'Walking': 'Active_Transport',
+    'Bike': 'Active_Transport',
+    'Automobile': 'Private_Transport',
+    'Motorbike': 'Private_Transport',
+}
+combined_df['MTRANS'] = combined_df['MTRANS'].replace(merge_map)
+print("Feature Engineering (BMI, MTRANS consolidation) complete.")
+
+# --- 3. Data Preprocessing Setup ---
+
+# Split back into Training and Testing Features
+X_train_full = combined_df.iloc[:len(train)].drop('id', axis=1)
+X_test_full = combined_df.iloc[len(train):].drop('id', axis=1)
+
+# Define column types
+numerical_cols = ['Age', 'Height', 'Weight', 'FCVC', 'NCP', 'CH2O', 'FAF', 'TUE', 'BMI']
+categorical_cols = ['Gender', 'family_history_with_overweight', 'FAVC', 'CAEC', 'SMOKE', 'SCC', 'CALC', 'MTRANS']
+
+# Preprocessing Pipeline (ColumnTransformer)
+preprocessor = ColumnTransformer(
+    transformers=[
+        ('num', StandardScaler(), numerical_cols), # Standard Scaler for numerical data
+        ('cat', OneHotEncoder(handle_unknown='ignore', sparse_output=False), categorical_cols) # One-Hot Encoding
+    ],
+    remainder='drop'
+)
+
+# Apply preprocessing to training data now for tuning stability
+X_train_processed = preprocessor.fit_transform(X_train_full)
+X_test_processed = preprocessor.transform(X_test_full)
+print("Data preprocessing applied and split for tuning.")
+
+# Target Variable Label Encoding
+le = LabelEncoder()
+y_encoded = le.fit_transform(y)
+
+# --- 4. Optuna Optimization with Enqueued Trials (YOUR ENQUEUED TRIALS HERE) ---
+
+# 4.1. Define Known Good Parameters to Enqueue
+
+# 1. Your GridSearch result (n_estimators=150, learning_rate=0.1)
+gs_params = {
+    'n_estimators': 150,
+    'max_depth': 6,
+    'learning_rate': 0.1,
+    'subsample': 0.8,
+    'colsample_bytree': 0.7,
+    # Added regularization parameters assuming defaults, as they weren't tuned in GridSearch
+    'gamma': 0.0,
+    'reg_lambda': 1.0,
+    'reg_alpha': 0.0
+}
+
+# 2. Your NEW Optuna Best result
+user_optuna_params = {
+    'n_estimators': 214,
+    'max_depth': 6,
+    'learning_rate': 0.07095514766703208,
+    'subsample': 0.9543727764077259,
+    'colsample_bytree': 0.7045887068551931,
+    'gamma': 0.0,
+    'reg_lambda': 1.0,
+    'reg_alpha': 0.0
+}
+
+# 3. A highly regularized/slow-learning configuration to explore a different region
+adv_params = {
+    'n_estimators': 750,
+    'max_depth': 7,
+    'learning_rate': 0.02,
+    'subsample': 0.8,
+    'colsample_bytree': 0.8,
+    'gamma': 0.2,
+    'reg_lambda': 1.5,
+    'reg_alpha': 0.5
+}
+
+enqueued_configs = [gs_params, user_optuna_params, adv_params]
+
+
+def objective(trial):
+    """Optuna objective function for XGBoost tuning."""
+    params = {
+        # Search space around promising regions
+        'n_estimators': trial.suggest_int('n_estimators', 100, 1000),
+        'max_depth': trial.suggest_int('max_depth', 5, 8),
+        'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1, log=True),
+        'subsample': trial.suggest_float('subsample', 0.7, 1.0),
+        'colsample_bytree': trial.suggest_float('colsample_bytree', 0.7, 1.0),
+        'gamma': trial.suggest_float('gamma', 0.0, 0.4),
+        'reg_lambda': trial.suggest_float('reg_lambda', 0.1, 2.0, log=True),
+        'reg_alpha': trial.suggest_float('reg_alpha', 0.0, 1.0),
+        'objective': 'multi:softmax',
+        'num_class': len(le.classes_),
+        'random_state': 42,
+        'use_label_encoder': False,
+        'eval_metric': 'mlogloss',
+        'n_jobs': -1
+    }
+
+    model = XGBClassifier(**params)
+
+    # Use Stratified K-Fold cross-validation
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    score = cross_val_score(model, X_train_processed, y_encoded, cv=cv, scoring='accuracy', verbose=0).mean()
+    return score
+
+
+study = optuna.create_study(direction='maximize')
+
+# Enqueue the known good trials (THIS IS WHAT YOU REQUESTED)
+for config in enqueued_configs:
+    study.enqueue_trial(config)
+
+print(f"\nEnqueued {len(enqueued_configs)} initial trials. Starting Optuna search (50 trials)...")
+
+# Run the optimization
+study.optimize(objective, n_trials=50, show_progress_bar=True)
+
+print("\nBest Optuna Score (CV):", study.best_value)
+print("Best Optuna Params:", study.best_params)
+
+# --- 5. Final Model Training and Prediction ---
+
+# Retrain the final model on the full training set using the best parameters found
+best_params = study.best_params
+best_params.update({
+    'objective': 'multi:softmax',
+    'num_class': len(le.classes_),
+    'random_state': 42,
+    'use_label_encoder': False,
+    'eval_metric': 'mlogloss',
+    'n_jobs': -1
+})
+
+final_best_model = XGBClassifier(**best_params)
+final_best_model.fit(X_train_processed, y_encoded)
+
+# Predict on the prepared test data
+predictions_encoded = final_best_model.predict(X_test_processed)
+predictions_category = le.inverse_transform(predictions_encoded)
+
+submission_df = pd.DataFrame({
+    'id': test_ids,
+    'WeightCategory': predictions_category
+})
+
+# Save to CSV and trigger download
+output_filename = "predictions_optuna_final.csv"
+submission_df.to_csv(output_filename, index=False)
+
+print("\n--- Final Predictions Complete ---")
+print(f"File '{output_filename}' created with {submission_df.shape[0]} entries.")
+
+# Trigger the download for the user
+files.download(output_filename)
+print("\n✅ Download of 'predictions_optuna_final.csv' should start shortly. Good luck!")
